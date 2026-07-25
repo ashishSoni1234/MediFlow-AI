@@ -1,4 +1,4 @@
-const AGENT_URL = import.meta.env.VITE_AGENT_SERVICE_URL || "http://localhost:8200";
+const AGENT_URL = import.meta.env.VITE_AGENT_SERVICE_URL || "http://127.0.0.1:8200";
 
 export async function sendMessage(sessionId, text, role, userRef) {
   const res = await fetch(`${AGENT_URL}/agent/message`, {

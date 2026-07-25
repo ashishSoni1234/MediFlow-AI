@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -23,6 +24,8 @@ import email_service
 import google_calendar
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP("mediflow-ai", stateless_http=True, host="0.0.0.0", port=int(os.environ.get("MCP_SERVER_PORT", 8100)))
 
@@ -188,14 +191,20 @@ async def book_appointment(
 
     patient = await db.find_or_create_patient(patient_name, patient_email)
 
-    calendar_event_id = await asyncio.to_thread(
-        google_calendar.create_event,
-        summary=f"Appointment: {patient['name']} with {doctor['name']}",
-        description=reason or "",
-        start=start,
-        duration_minutes=duration_minutes,
-        attendee_email=patient_email,
-    )
+    try:
+        calendar_event_id = await asyncio.to_thread(
+            google_calendar.create_event,
+            summary=f"Appointment: {patient['name']} with {doctor['name']}",
+            description=reason or "",
+            start=start,
+            duration_minutes=duration_minutes,
+            attendee_email=patient_email,
+        )
+    except Exception:
+        # Best-effort only — Postgres below is the source of truth for the
+        # booking, so a Google Calendar/OAuth failure must not block it.
+        logger.exception("Google Calendar event creation failed; booking without it")
+        calendar_event_id = None
 
     appointment = await db.insert_appointment(
         doctor["id"], patient["id"], start, duration_minutes, reason, calendar_event_id
