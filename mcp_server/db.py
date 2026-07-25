@@ -6,6 +6,7 @@ focused on MCP concerns (schemas, descriptions) rather than queries.
 from __future__ import annotations
 
 import os
+import re
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
@@ -28,14 +29,36 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 
-async def find_doctor_by_name(name: str) -> dict[str, Any] | None:
+def _normalize_doctor_query(name: str) -> str:
+    """Strip title prefixes and punctuation so 'ahuja', 'dr ahuja',
+    'Dr. Ahuja', and 'DR AHUJA' all normalize to the same string."""
+    normalized = name.strip().lower()
+    normalized = re.sub(r"^dr\.?\s+", "", normalized)
+    normalized = re.sub(r"[.,]", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+async def find_doctors_by_name(name: str) -> list[dict[str, Any]]:
+    """Find every doctor whose name matches the query, tolerant of 'Dr.'
+    prefixes, punctuation, and case. Returns all matches (not just the
+    first) so callers can ask the patient to disambiguate when a query
+    like 'sharma' matches more than one doctor.
+    """
+    query = _normalize_doctor_query(name)
+    if not query:
+        return []
+
     pool = await get_pool()
-    row = await pool.fetchrow(
-        "SELECT * FROM doctors WHERE name ILIKE $1 OR name ILIKE $2 LIMIT 1",
-        name,
-        f"%{name}%",
-    )
-    return dict(row) if row else None
+    rows = await pool.fetch("SELECT * FROM doctors")
+    matches = [
+        dict(row)
+        for row in rows
+        if query == (doctor_norm := _normalize_doctor_query(row["name"]))
+        or query in doctor_norm
+        or doctor_norm in query
+    ]
+    return matches
 
 
 async def find_or_create_patient(name: str, email: str | None, phone: str | None = None) -> dict[str, Any]:
@@ -97,40 +120,115 @@ def compute_free_slots(
     return slots
 
 
-async def insert_appointment(
+def has_conflict(
+    start: datetime,
+    duration_minutes: int,
+    booked: list[dict[str, Any]],
+    exclude_scheduled_at: datetime | None = None,
+) -> bool:
+    """Pure overlap check shared by booking and rescheduling.
+
+    `exclude_scheduled_at` lets a reschedule ignore the appointment's own
+    current slot when checking against the doctor's other bookings.
+    """
+    end = start + timedelta(minutes=duration_minutes)
+    for b in booked:
+        if exclude_scheduled_at is not None and b["scheduled_at"] == exclude_scheduled_at:
+            continue
+        b_end = b["scheduled_at"] + timedelta(minutes=b["duration_minutes"])
+        if start < b_end and end > b["scheduled_at"]:
+            return True
+    return False
+
+
+async def book_appointment_atomic(
     doctor_id: int,
     patient_id: int,
     scheduled_at: datetime,
     duration_minutes: int,
     reason: str | None,
-    google_calendar_event_id: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
+    """Checks for conflicts and inserts the appointment in one transaction,
+    serialized per-doctor with a Postgres advisory lock so two concurrent
+    bookings for the same slot can't both pass the conflict check.
+
+    Returns None if the slot is no longer free. `google_calendar_event_id`
+    is deliberately not set here — that's a best-effort network call added
+    afterwards via `set_calendar_event_id`, kept outside the lock so a slow
+    Calendar API doesn't hold the advisory lock open.
+    """
     pool = await get_pool()
-    row = await pool.fetchrow(
-        """
-        INSERT INTO appointments
-            (doctor_id, patient_id, scheduled_at, duration_minutes, reason, google_calendar_event_id)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING *
-        """,
-        doctor_id,
-        patient_id,
-        scheduled_at,
-        duration_minutes,
-        reason,
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", doctor_id)
+            rows = await conn.fetch(
+                """
+                SELECT scheduled_at, duration_minutes FROM appointments
+                WHERE doctor_id = $1 AND status != 'cancelled' AND scheduled_at::date = $2
+                """,
+                doctor_id,
+                scheduled_at.date(),
+            )
+            booked = [dict(r) for r in rows]
+            if has_conflict(scheduled_at, duration_minutes, booked):
+                return None
+
+            row = await conn.fetchrow(
+                """
+                INSERT INTO appointments (doctor_id, patient_id, scheduled_at, duration_minutes, reason)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+                """,
+                doctor_id,
+                patient_id,
+                scheduled_at,
+                duration_minutes,
+                reason,
+            )
+            return dict(row)
+
+
+async def set_calendar_event_id(appointment_id: int, google_calendar_event_id: str) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE appointments SET google_calendar_event_id = $1 WHERE id = $2",
         google_calendar_event_id,
-    )
-    return dict(row)
-
-
-async def update_appointment_time(appointment_id: int, new_scheduled_at: datetime) -> dict[str, Any] | None:
-    pool = await get_pool()
-    row = await pool.fetchrow(
-        "UPDATE appointments SET scheduled_at = $1 WHERE id = $2 RETURNING *",
-        new_scheduled_at,
         appointment_id,
     )
-    return dict(row) if row else None
+
+
+async def reschedule_appointment_atomic(
+    appointment_id: int,
+    doctor_id: int,
+    current_scheduled_at: datetime,
+    duration_minutes: int,
+    new_scheduled_at: datetime,
+) -> dict[str, Any] | None:
+    """Same locked-transaction pattern as book_appointment_atomic, but for
+    moving an existing appointment. Returns None on conflict.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", doctor_id)
+            rows = await conn.fetch(
+                """
+                SELECT scheduled_at, duration_minutes FROM appointments
+                WHERE doctor_id = $1 AND status != 'cancelled' AND scheduled_at::date = $2
+                """,
+                doctor_id,
+                new_scheduled_at.date(),
+            )
+            booked = [dict(r) for r in rows]
+            if has_conflict(new_scheduled_at, duration_minutes, booked, exclude_scheduled_at=current_scheduled_at):
+                return None
+
+            row = await conn.fetchrow(
+                "UPDATE appointments SET scheduled_at = $1 WHERE id = $2 RETURNING *",
+                new_scheduled_at,
+                appointment_id,
+            )
+            return dict(row) if row else None
 
 
 async def get_appointment_stats(

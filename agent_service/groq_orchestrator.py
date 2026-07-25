@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import os
 from typing import Any
 
 from dotenv import load_dotenv
-from groq import AsyncGroq
+from groq import AsyncGroq, RateLimitError
 
 from mcp_client import mcp_session, tool_result_to_text, tool_to_groq_schema
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_TOOL_ROUNDS = 6
@@ -37,8 +40,23 @@ def build_system_message(role: str) -> dict[str, str]:
     else:
         audience = (
             "You are speaking with a patient. Help them check availability and "
-            "book appointments. Always confirm doctor, date/time, and reason before "
-            "booking."
+            "book appointments. Before calling book_appointment you MUST have "
+            "collected, directly from the patient's own messages, all of the "
+            "following: (1) the doctor and a confirmed free slot (via "
+            "check_doctor_availability), (2) the patient's full name, (3) the "
+            "patient's email address, and (4) the reason for the visit. If any "
+            "of these is missing, ask the patient for exactly that information "
+            "in plain language and wait for their reply — do not call "
+            "book_appointment yet. Never invent, guess, or fill in a placeholder "
+            "value (e.g. literally 'patient_name', 'reason', 'email', 'N/A') for "
+            "any of these fields; only use what the patient actually typed. If "
+            "book_appointment returns an error saying required information is "
+            "missing or invalid, tell the patient in natural language exactly "
+            "what's still needed and do not retry the booking until they've "
+            "provided it. If book_appointment fails because the slot is already "
+            "taken, call suggest_reschedule with the same doctor and originally "
+            "requested time, and offer the patient the 2-3 nearest alternative "
+            "slots instead of just reporting the failure."
         )
     return {
         "role": "system",
@@ -84,12 +102,43 @@ async def run_agent_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
 
         rounds = 0
         while True:
-            response = await groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=messages,
-                tools=llm_tools,
-                tool_choice="auto",
-            )
+            try:
+                response = await groq_client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=messages,
+                    tools=llm_tools,
+                    tool_choice="auto",
+                )
+            except RateLimitError:
+                # The daily/per-minute token quota on the Groq account is
+                # exhausted — no rephrasing will fix this, so say so instead
+                # of the generic fallback below.
+                logger.exception("Groq completion request rate-limited")
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "The assistant is temporarily rate-limited by the LLM "
+                            "provider — please try again in a few minutes."
+                        ),
+                    }
+                )
+                break
+            except Exception:
+                # A malformed tool call, provider outage, etc. must not
+                # crash the whole request (and, worse, the shared MCP
+                # session's connection) — surface a normal assistant reply
+                # instead so the frontend gets a clean response to show
+                # the user.
+                logger.exception("Groq completion request failed")
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "Sorry, I ran into a problem processing that — could you try rephrasing?",
+                    }
+                )
+                break
+
             msg = response.choices[0].message
             messages.append(_assistant_message_to_dict(msg))
 

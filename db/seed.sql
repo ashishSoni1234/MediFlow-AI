@@ -9,7 +9,17 @@ INSERT INTO doctors (name, specialty, email, working_hours_start, working_hours_
     ('Dr. Ahuja', 'General Physician', 'ahuja@mediflow.example', '09:00', '17:00'),
     ('Dr. Mehta', 'Pediatrics', 'mehta@mediflow.example', '10:00', '18:00'),
     ('Dr. Rao', 'Dermatology', 'rao@mediflow.example', '09:30', '16:30')
-ON CONFLICT DO NOTHING;
+ON CONFLICT (email) DO NOTHING;
+
+-- Demo login password for all three seeded doctors: "mediflow123"
+-- (bcrypt — see agent_service/auth.py). Doctor signups are restricted to
+-- these pre-seeded emails (agent_service/main.py's /auth/signup), so this
+-- is what lets the demo doctors log in without going through signup.
+INSERT INTO users (name, email, password_hash, role, linked_id)
+SELECT d.name, d.email, '$2b$12$BXfh5Y7QkSAciJ1ytXWNP.oxiRcI/6f1VoWt5hOb/nQ5UXwbz15si', 'doctor', d.id
+FROM doctors d
+WHERE d.email IN ('ahuja@mediflow.example', 'mehta@mediflow.example', 'rao@mediflow.example')
+ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash;
 
 INSERT INTO patients (name, email, phone) VALUES
     ('Aarav Sharma', 'aarav.sharma@example.com', '9800000001'),

@@ -1,35 +1,62 @@
 import { useState, useEffect, useCallback } from "react";
-import { sendMessage, getDaySummary, getNotifications, markNotificationRead } from "./api";
+import { sendMessage, getDaySummary, getNotifications, markNotificationRead, getSessionHistory } from "./api";
+import ChatSidebar from "./ChatSidebar";
+import { getOrCreateSessionId, newSessionId } from "./session";
 
-// Seeded demo doctors (see db/seed.sql) — just for the dashboard's doctor
-// picker, unrelated to how the LLM chooses tools.
-const DOCTORS = [
-  { id: 1, name: "Dr. Ahuja" },
-  { id: 2, name: "Dr. Mehta" },
-  { id: 3, name: "Dr. Rao" },
-];
+const LAST_SESSION_KEY_PREFIX = "mediflow_doctor_last_session_";
 
-export default function DoctorDashboard({ sessionId }) {
-  const [doctor, setDoctor] = useState(DOCTORS[0]);
+// `doctor` is the identity established via JWT at login (see AuthPage.jsx)
+// — no client-side picker, so a signed-in doctor can only ever act as
+// themselves.
+export default function DoctorDashboard({ doctor, onLogout }) {
+  const lastSessionKey = `${LAST_SESSION_KEY_PREFIX}${doctor.linkedId}`;
+  const [sessionId, setSessionId] = useState(() => getOrCreateSessionId(lastSessionKey));
   const [query, setQuery] = useState("");
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [notifications, setNotifications] = useState([]);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const unreadCount = notifications.filter((n) => !n.read).length;
+
+  useEffect(() => {
+    let cancelled = false;
+    getSessionHistory(sessionId)
+      .then((history) => {
+        if (!cancelled) setMessages(history);
+      })
+      .catch(() => {
+        // no prior session yet, or agent service unreachable
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
 
   const refreshNotifications = useCallback(async () => {
     try {
-      const list = await getNotifications(doctor.id);
+      const list = await getNotifications(doctor.linkedId);
       setNotifications(list);
     } catch {
       // polling best-effort; ignore transient errors
     }
-  }, [doctor.id]);
+  }, [doctor.linkedId]);
 
   useEffect(() => {
     refreshNotifications();
     const interval = setInterval(refreshNotifications, 8000);
     return () => clearInterval(interval);
   }, [refreshNotifications]);
+
+  function handleSelectSession(id) {
+    setSessionId(id);
+    localStorage.setItem(lastSessionKey, id);
+  }
+
+  function handleNewChat() {
+    handleSelectSession(newSessionId("mediflow_doctor_session"));
+    setMessages([]);
+  }
 
   async function handleAsk(e) {
     e.preventDefault();
@@ -39,12 +66,13 @@ export default function DoctorDashboard({ sessionId }) {
     setQuery("");
     setLoading(true);
     try {
-      const { reply } = await sendMessage(sessionId, text, "doctor", doctor.id);
+      const { reply } = await sendMessage(sessionId, text);
       setMessages((m) => [...m, { role: "assistant", content: reply }]);
     } catch (err) {
       setMessages((m) => [...m, { role: "assistant", content: `Error: ${err.message}` }]);
     } finally {
       setLoading(false);
+      setRefreshKey((k) => k + 1);
     }
   }
 
@@ -52,28 +80,70 @@ export default function DoctorDashboard({ sessionId }) {
     setLoading(true);
     setMessages((m) => [...m, { role: "user", content: `Get today's summary for ${doctor.name}` }]);
     try {
-      const { reply } = await getDaySummary(sessionId, doctor.name, "today", doctor.id);
+      const { reply } = await getDaySummary(sessionId, doctor.name, "today");
       setMessages((m) => [...m, { role: "assistant", content: reply }]);
     } catch (err) {
       setMessages((m) => [...m, { role: "assistant", content: `Error: ${err.message}` }]);
     } finally {
       setLoading(false);
+      setRefreshKey((k) => k + 1);
     }
   }
 
   return (
     <div className="dashboard">
+      <ChatSidebar
+        currentSessionId={sessionId}
+        onSelect={handleSelectSession}
+        onNewChat={handleNewChat}
+        onSessionDeleted={handleNewChat}
+        refreshKey={refreshKey}
+      />
       <div className="panel chat-panel">
         <div className="dashboard-toolbar">
-          <select value={doctor.id} onChange={(e) => setDoctor(DOCTORS.find((d) => d.id === Number(e.target.value)))}>
-            {DOCTORS.map((d) => (
-              <option key={d.id} value={d.id}>
-                {d.name}
-              </option>
-            ))}
-          </select>
+          <span className="doctor-name">{doctor.name}</span>
           <button type="button" onClick={handleSummary} disabled={loading}>
             Get Today's Summary
+          </button>
+          <div className="notif-wrap">
+            <button
+              type="button"
+              className="notif-bell"
+              onClick={() => setNotifOpen((o) => !o)}
+              aria-label="Notifications"
+            >
+              🔔
+              {unreadCount > 0 && <span className="notif-badge">{unreadCount}</span>}
+            </button>
+            {notifOpen && (
+              <div className="panel notifications-panel">
+                <h3>Notifications</h3>
+                {notifications.length === 0 && <p className="muted">No notifications.</p>}
+                <ul>
+                  {notifications.map((n) => (
+                    <li key={n.id} className={n.read ? "read" : "unread"}>
+                      <span className="notif-channel">{n.channel}</span>
+                      <span>{n.message}</span>
+                      {!n.read && (
+                        <button
+                          type="button"
+                          className="mark-read"
+                          onClick={async () => {
+                            await markNotificationRead(n.id);
+                            refreshNotifications();
+                          }}
+                        >
+                          Mark read
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+          <button type="button" className="logout" onClick={onLogout}>
+            Log out
           </button>
         </div>
         <div className="chat-messages">
@@ -82,7 +152,13 @@ export default function DoctorDashboard({ sessionId }) {
               {m.content}
             </div>
           ))}
-          {loading && <div className="chat-bubble assistant thinking">…</div>}
+          {loading && (
+            <div className="chat-bubble assistant thinking">
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+            </div>
+          )}
         </div>
         <form className="chat-input-row" onSubmit={handleAsk}>
           <input
@@ -95,31 +171,6 @@ export default function DoctorDashboard({ sessionId }) {
             Ask
           </button>
         </form>
-      </div>
-
-      <div className="panel notifications-panel">
-        <h3>Notifications</h3>
-        {notifications.length === 0 && <p className="muted">No notifications.</p>}
-        <ul>
-          {notifications.map((n) => (
-            <li key={n.id} className={n.read ? "read" : "unread"}>
-              <span className="notif-channel">{n.channel}</span>
-              <span>{n.message}</span>
-              {!n.read && (
-                <button
-                  type="button"
-                  className="mark-read"
-                  onClick={async () => {
-                    await markNotificationRead(n.id);
-                    refreshNotifications();
-                  }}
-                >
-                  Mark read
-                </button>
-              )}
-            </li>
-          ))}
-        </ul>
       </div>
     </div>
   );

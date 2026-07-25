@@ -1,36 +1,67 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import PatientChat from "./PatientChat";
 import DoctorDashboard from "./DoctorDashboard";
+import AuthPage from "./AuthPage";
+import PromptHistory from "./PromptHistory";
+import { getCurrentUser, setToken, logout as clearAuth } from "./auth";
+import toothLogo from "./assets/tooth-logo.png";
 import "./App.css";
 
-function newSessionId(prefix) {
-  return `${prefix}-${crypto.randomUUID()}`;
-}
-
 export default function App() {
-  const [view, setView] = useState("patient");
-  const patientSessionId = useMemo(() => newSessionId("patient"), []);
-  const doctorSessionId = useMemo(() => newSessionId("doctor"), []);
+  const [user, setUser] = useState(getCurrentUser);
+  const [tab, setTab] = useState("main"); // "main" | "history"
+
+  function handleAuth(auth) {
+    setToken(auth.token);
+    setUser({ role: auth.role, name: auth.name, linkedId: auth.linked_id });
+    setTab("main");
+  }
+
+  function handleLogout() {
+    clearAuth();
+    setUser(null);
+    setTab("main");
+  }
 
   return (
-    <div className="app">
-      <header className="app-header">
-        <h1>MediFlow-AI</h1>
-        <nav>
-          <button className={view === "patient" ? "active" : ""} onClick={() => setView("patient")}>
-            Patient Chat
-          </button>
-          <button className={view === "doctor" ? "active" : ""} onClick={() => setView("doctor")}>
-            Doctor Dashboard
-          </button>
-        </nav>
-      </header>
+    <div className={`app${!user ? " app--auth" : ""}`}>
+      {user && (
+        <div className="app-bg" aria-hidden="true">
+          <div className="auth-blob auth-blob-1" />
+          <div className="auth-blob auth-blob-2" />
+          <div className="auth-blob auth-blob-3" />
+          <div className="auth-grid" />
+        </div>
+      )}
+      {user && (
+        <header className="app-header">
+          <h1 className="brand">
+            <img className="brand-icon" src={toothLogo} alt="" aria-hidden="true" />
+            MediFlow
+          </h1>
+          <nav>
+            <button className={tab === "main" ? "active" : ""} onClick={() => setTab("main")}>
+              {user.role === "doctor" ? "Dashboard" : "Chat"}
+            </button>
+            <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>
+              History
+            </button>
+            <button className="logout" onClick={handleLogout}>
+              Log out
+            </button>
+          </nav>
+        </header>
+      )}
 
-      <main>
-        {view === "patient" ? (
-          <PatientChat sessionId={patientSessionId} />
+      <main className={!user ? "auth-main" : ""}>
+        {!user ? (
+          <AuthPage onAuth={handleAuth} />
+        ) : tab === "history" ? (
+          <PromptHistory />
+        ) : user.role === "doctor" ? (
+          <DoctorDashboard doctor={user} onLogout={handleLogout} />
         ) : (
-          <DoctorDashboard sessionId={doctorSessionId} />
+          <PatientChat patient={user} />
         )}
       </main>
     </div>

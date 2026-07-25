@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import smtplib
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from dotenv import load_dotenv
@@ -24,11 +25,22 @@ def is_configured() -> bool:
     return bool(SMTP_USER and SMTP_APP_PASSWORD)
 
 
-def send_email(to_email: str, subject: str, body: str) -> bool:
+def send_email(to_email: str, subject: str, body: str, html_body: str | None = None) -> bool:
+    """Sends a plain-text email, or a multipart text+HTML email if html_body is given.
+
+    Mail clients that render HTML will show html_body; everything else falls
+    back to the plain-text body (MIME requires the plain-text alternative to
+    be attached first).
+    """
     if not is_configured():
         return False
 
-    msg = MIMEText(body)
+    if html_body:
+        msg: MIMEMultipart | MIMEText = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+    else:
+        msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = to_email

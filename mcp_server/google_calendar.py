@@ -48,8 +48,8 @@ def create_event(
     start: dt.datetime,
     duration_minutes: int,
     attendee_email: str | None = None,
-) -> str | None:
-    """Creates a calendar event and returns its event id, or None if not configured."""
+) -> dict | None:
+    """Creates a calendar event and returns {"id", "html_link"}, or None if not configured."""
     if not is_configured():
         return None
 
@@ -64,8 +64,8 @@ def create_event(
     if attendee_email:
         body["attendees"] = [{"email": attendee_email}]
 
-    event = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=body).execute()
-    return event.get("id")
+    event = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=body, sendUpdates="all").execute()
+    return {"id": event.get("id"), "html_link": event.get("htmlLink")}
 
 
 def delete_event(event_id: str) -> None:
