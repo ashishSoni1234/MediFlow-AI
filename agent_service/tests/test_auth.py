@@ -48,6 +48,16 @@ def test_access_token_round_trips_claims():
 
 def test_tampered_token_fails_to_decode():
     token = create_access_token(user_id=1, role="patient", linked_id=5, name="Aarav Sharma")
-    tampered = token[:-1] + ("A" if token[-1] != "A" else "B")
+    # Flip a character in the middle of the signature segment, not the very
+    # last character of the token. base64url's final quantum can have "don't
+    # care" trailing bits, so occasionally flipping the last character
+    # decodes to the exact same signature bytes — that made this test flaky
+    # (it was observed to fail ~1 in 16 runs). A middle character always
+    # changes a full byte, so this is a deterministic tamper.
+    header, payload, signature = token.split(".")
+    mid = len(signature) // 2
+    flipped_char = "A" if signature[mid] != "A" else "B"
+    tampered_signature = signature[:mid] + flipped_char + signature[mid + 1 :]
+    tampered = f"{header}.{payload}.{tampered_signature}"
     with pytest.raises(pyjwt.PyJWTError):
         decode_access_token(tampered)

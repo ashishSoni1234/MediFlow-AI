@@ -31,6 +31,16 @@ async def list_notifications(doctor_id: int, unread_only: bool = False) -> list[
     ]
 
 
-async def mark_read(notification_id: int) -> None:
+async def mark_read(notification_id: int, doctor_id: int) -> bool:
+    """Marks a notification read only if it belongs to doctor_id.
+
+    Returns False (without writing) for a missing or another doctor's
+    notification, so the caller can 403 rather than silently no-op.
+    """
     pool = await get_pool()
-    await pool.execute("UPDATE notifications SET read = true WHERE id = $1", notification_id)
+    result = await pool.execute(
+        "UPDATE notifications SET read = true WHERE id = $1 AND doctor_id = $2",
+        notification_id,
+        doctor_id,
+    )
+    return result.endswith(" 1")

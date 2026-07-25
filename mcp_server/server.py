@@ -502,6 +502,8 @@ async def appointment_resource(appointment_id: str) -> dict:
         return {"error": f"No appointment found with id {appointment_id}"}
     return {
         "id": appt["id"],
+        "doctor_id": appt["doctor_id"],
+        "patient_id": appt["patient_id"],
         "doctor_name": appt["doctor_name"],
         "patient_name": appt["patient_name"],
         "patient_email": appt["patient_email"],
@@ -523,5 +525,45 @@ def summarize_doctor_day(doctor_name: str, date: str = "today") -> str:
     )
 
 
+class _SharedSecretMiddleware:
+    """Optional bearer-token gate in front of the MCP endpoint.
+
+    The MCP server otherwise trusts anything that can reach its port — fine
+    for a demo where it's only reachable from the agent service on a private
+    network, but a real gap if this port is ever exposed. Set MCP_SHARED_SECRET
+    (and the matching value in the agent service's env) to require
+    `Authorization: Bearer <secret>` on every request; leave it unset to keep
+    today's no-auth behavior.
+    """
+
+    def __init__(self, app, secret: str) -> None:
+        self.app = app
+        self.secret = secret
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        auth_header = headers.get(b"authorization", b"").decode("latin-1")
+        if auth_header != f"Bearer {self.secret}":
+            from starlette.responses import PlainTextResponse
+
+            response = PlainTextResponse("Unauthorized", status_code=401)
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    shared_secret = os.environ.get("MCP_SHARED_SECRET")
+    if not shared_secret:
+        mcp.run(transport="streamable-http")
+    else:
+        import uvicorn
+
+        app = mcp.streamable_http_app()
+        app.add_middleware(_SharedSecretMiddleware, secret=shared_secret)
+        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("MCP_SERVER_PORT", 8100)))

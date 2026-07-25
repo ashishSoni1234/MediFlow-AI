@@ -10,11 +10,15 @@ Run standalone:
 from __future__ import annotations
 
 import json
+import os
+import re
 import secrets
+import time
+from collections import defaultdict
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 import doctors_store
 import notifications_store
@@ -34,12 +38,51 @@ from mcp_client import mcp_session
 
 app = FastAPI(title="MediFlow-AI Agent Service")
 
+# Defaults cover the Vite dev server; production deployments should set
+# CORS_ORIGINS to their real frontend origin(s) rather than relying on these.
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _normalize_doctor_name(name: str) -> str:
+    """Same normalization as mcp_server/db.py's _normalize_doctor_query —
+    duplicated here (a separate process/deployable) so /agent/summary and
+    /doctor/schedule can compare a client-supplied doctor_name against the
+    authenticated doctor's own JWT-claimed name without a round trip.
+    """
+    normalized = name.strip().lower()
+    normalized = re.sub(r"^dr\.?\s+", "", normalized)
+    normalized = re.sub(r"[.,]", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+# --- Minimal in-memory rate limiting for auth endpoints ---------------------
+# Per-process only (won't survive a restart or work across multiple
+# replicas) — adequate for this app's single-instance demo deployment, not a
+# substitute for a real distributed limiter in production.
+_RATE_LIMIT_WINDOW_SECONDS = 300
+_RATE_LIMIT_MAX_ATTEMPTS = 10
+_auth_attempts: dict[str, list[float]] = defaultdict(list)
+
+
+def _enforce_rate_limit(key: str) -> None:
+    now = time.monotonic()
+    attempts = _auth_attempts[key]
+    attempts[:] = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW_SECONDS]
+    if len(attempts) >= _RATE_LIMIT_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Too many attempts — please try again later")
+    attempts.append(now)
 
 
 class AuthResponse(BaseModel):
@@ -55,13 +98,21 @@ class SignupRequest(BaseModel):
     password: str
     role: str  # "patient" or "doctor"
 
+    @field_validator("password")
+    @classmethod
+    def _password_min_length(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return value
+
 
 @app.post("/auth/signup", response_model=AuthResponse)
-async def signup(req: SignupRequest) -> AuthResponse:
+async def signup(req: SignupRequest, request: Request) -> AuthResponse:
     """Patients can sign up freely. Doctor signup is restricted to the
     pre-seeded doctor emails in db/seed.sql — this stops a random signup
     from minting a new, unverified doctor identity.
     """
+    _enforce_rate_limit(f"signup:{request.client.host if request.client else 'unknown'}")
     email = req.email.strip().lower()
     if req.role not in ("patient", "doctor"):
         raise HTTPException(status_code=400, detail="role must be 'patient' or 'doctor'")
@@ -90,7 +141,8 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/auth/login", response_model=AuthResponse)
-async def login(req: LoginRequest) -> AuthResponse:
+async def login(req: LoginRequest, request: Request) -> AuthResponse:
+    _enforce_rate_limit(f"login:{request.client.host if request.client else 'unknown'}")
     user = await users_store.get_user_by_email(req.email.strip().lower())
     if not user or not verify_password(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -188,6 +240,9 @@ async def agent_summary(
     genuine MCP prompts/get call, not a hardcoded f-string here) and runs
     the resulting text through the same tool-calling loop as a chat message.
     """
+    if _normalize_doctor_name(req.doctor_name) != _normalize_doctor_name(user["name"]):
+        raise HTTPException(status_code=403, detail="You can only request a summary for your own schedule")
+
     owner = await session_store.get_session_owner(req.session_id)
     if owner is not None and owner != ("doctor", user["linked_id"]):
         raise HTTPException(status_code=403, detail="This session belongs to a different account")
@@ -232,6 +287,9 @@ async def doctor_schedule(doctor_name: str, date: str = "today", user: dict = De
     """Reads the doctor-schedule MCP RESOURCE directly (no LLM involved) —
     demonstrates resources as addressable reads, distinct from tool actions.
     """
+    if _normalize_doctor_name(doctor_name) != _normalize_doctor_name(user["name"]):
+        raise HTTPException(status_code=403, detail="You can only view your own schedule")
+
     async with mcp_session() as session:
         result = await session.read_resource(f"doctor-schedule://{doctor_name}/{date}")
     text = result.contents[0].text if result.contents else "{}"
@@ -239,14 +297,30 @@ async def doctor_schedule(doctor_name: str, date: str = "today", user: dict = De
 
 
 @app.get("/appointment/{appointment_id}")
-async def get_appointment(appointment_id: int) -> dict:
+async def get_appointment(appointment_id: int, user: dict = Depends(get_current_user)) -> dict:
     """Reads the appointment MCP RESOURCE directly (no LLM involved) — the
     per-appointment counterpart to /doctor/schedule above.
+
+    Requires the caller to be either the patient or the doctor on the
+    appointment — previously this endpoint had no auth at all, letting
+    anyone read any patient's name/email/reason for visit by id.
     """
     async with mcp_session() as session:
         result = await session.read_resource(f"appointment://{appointment_id}")
     text = result.contents[0].text if result.contents else "{}"
-    return json.loads(text)
+    data = json.loads(text)
+    if "error" in data:
+        raise HTTPException(status_code=404, detail=data["error"])
+
+    is_owner = (user["role"] == "doctor" and data.get("doctor_id") == user["linked_id"]) or (
+        user["role"] == "patient" and data.get("patient_id") == user["linked_id"]
+    )
+    if not is_owner:
+        raise HTTPException(status_code=403, detail="You do not have access to this appointment")
+
+    data.pop("doctor_id", None)
+    data.pop("patient_id", None)
+    return data
 
 
 @app.get("/notifications/{doctor_id}")
@@ -260,7 +334,9 @@ async def get_notifications(
 
 @app.post("/notifications/{notification_id}/read")
 async def read_notification(notification_id: int, user: dict = Depends(require_doctor)) -> dict:
-    await notifications_store.mark_read(notification_id)
+    ok = await notifications_store.mark_read(notification_id, user["linked_id"])
+    if not ok:
+        raise HTTPException(status_code=403, detail="Cannot mark another doctor's notification as read")
     return {"status": "ok"}
 
 

@@ -18,11 +18,13 @@ from mcp.client.streamable_http import streamablehttp_client
 load_dotenv()
 
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8100/mcp")
+MCP_SHARED_SECRET = os.environ.get("MCP_SHARED_SECRET")
 
 
 @asynccontextmanager
 async def mcp_session():
-    async with streamablehttp_client(MCP_SERVER_URL) as (read, write, _get_session_id):
+    headers = {"Authorization": f"Bearer {MCP_SHARED_SECRET}"} if MCP_SHARED_SECRET else None
+    async with streamablehttp_client(MCP_SERVER_URL, headers=headers) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             await session.initialize()
             yield session
