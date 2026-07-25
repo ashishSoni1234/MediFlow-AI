@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mediflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mediflow
+      POSTGRES_PASSWORD: mediflow
+      POSTGRES_DB: mediflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - mediflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mediflow -d mediflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mediflow_pgdata:
