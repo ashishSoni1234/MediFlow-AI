@@ -7,6 +7,7 @@
 **An agentic AI clinic assistant — patients book appointments by chatting in plain English, doctors get instant summaries and reports, and every action is powered by a genuine MCP tool-calling loop.**
 
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-Visit%20App-8b5cf6?style=for-the-badge&logo=vercel&logoColor=white)](https://medi-flow-ai-six.vercel.app/)
+[![YouTube Demo](https://img.shields.io/badge/YouTube-Watch%20Demo-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtu.be/UONunPbf1HA)
 [![Documentation](https://img.shields.io/badge/Documentation-Read%20Full%20Docs-2563eb?style=for-the-badge&logo=readthedocs&logoColor=white)](DOCUMENTATION.md)
 
 <br/>
