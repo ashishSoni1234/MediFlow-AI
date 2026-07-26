@@ -65,6 +65,13 @@ async def find_or_create_patient(name: str, email: str | None, phone: str | None
     pool = await get_pool()
     row = await pool.fetchrow("SELECT * FROM patients WHERE email = $1", email)
     if row:
+        if name and name != row["name"]:
+            row = await pool.fetchrow(
+                "UPDATE patients SET name = $1, phone = COALESCE($2, phone) WHERE id = $3 RETURNING *",
+                name,
+                phone,
+                row["id"],
+            )
         return dict(row)
     row = await pool.fetchrow(
         "INSERT INTO patients (name, email, phone) VALUES ($1, $2, $3) RETURNING *",
