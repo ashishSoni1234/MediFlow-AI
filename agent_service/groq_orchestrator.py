@@ -70,7 +70,12 @@ def build_system_message(role: str) -> dict[str, str]:
             "language rather than pretending it succeeded. Do not call the same "
             "tool with the same arguments more than once in a turn. When a tool "
             "result includes a 'total' or count field, quote that number exactly "
-            "in your answer rather than recounting or adding results yourself."
+            "in your answer rather than recounting or adding results yourself. "
+            "If a tool result includes 'confirmation_email_sent' or 'sent' as "
+            "false for an email, tell the user plainly that the email could not "
+            "be sent (e.g. suggest checking spam, or that they can ask again "
+            "later) — never promise or imply that an email is on its way unless "
+            "the tool result actually confirms it was sent."
         ),
     }
 
