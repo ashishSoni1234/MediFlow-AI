@@ -27,9 +27,24 @@ from email_templates import build_confirmation_email
 
 load_dotenv()
 
+_LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(_LOG_DIR, "mcp_server.log"), encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("mediflow-ai", stateless_http=True, host="0.0.0.0", port=int(os.environ.get("MCP_SERVER_PORT", 8100)))
+mcp = FastMCP(
+    "mediflow-ai",
+    stateless_http=True,
+    host="0.0.0.0",
+    port=int(os.environ.get("MCP_SERVER_PORT") or os.environ.get("PORT", 8100)),
+)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PLACEHOLDER_TOKENS = {
@@ -280,6 +295,25 @@ async def book_appointment(
     if calendar_event and calendar_event.get("id"):
         await db.set_calendar_event_id(appointment["id"], calendar_event["id"])
 
+    # Doctor notification is inserted here, unconditionally on a successful
+    # booking, rather than left as a separate `notify_doctor` tool call the
+    # LLM has to remember to make on its own initiative — that's exactly why
+    # doctors never saw a notification for patient-booked appointments.
+    doctor_notified = False
+    try:
+        await db.insert_notification(
+            doctor["id"],
+            (
+                f"New appointment booked: {patient['name']} on "
+                f"{appointment['scheduled_at'].strftime('%Y-%m-%d %H:%M')} "
+                f"({reason or 'General consultation'})."
+            ),
+            "in_app",
+        )
+        doctor_notified = True
+    except Exception:
+        logger.exception("Doctor notification insert failed; booking stands regardless")
+
     # Confirmation email is sent here, unconditionally on a successful
     # booking, rather than left as a tool the LLM has to remember to call
     # afterwards — that made delivery dependent on model discretion.
@@ -315,6 +349,7 @@ async def book_appointment(
         "calendar_event_created": calendar_event is not None,
         "calendar_event_link": calendar_event.get("html_link") if calendar_event else None,
         "confirmation_email_sent": email_sent,
+        "doctor_notified": doctor_notified,
     }
 
 
@@ -566,4 +601,8 @@ if __name__ == "__main__":
 
         app = mcp.streamable_http_app()
         app.add_middleware(_SharedSecretMiddleware, secret=shared_secret)
-        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("MCP_SERVER_PORT", 8100)))
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=int(os.environ.get("MCP_SERVER_PORT") or os.environ.get("PORT", 8100)),
+        )

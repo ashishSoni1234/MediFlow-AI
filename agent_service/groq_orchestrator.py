@@ -8,14 +8,17 @@ plumbing, not intent classification.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
 import os
+import re
+import uuid
 from typing import Any
 
 from dotenv import load_dotenv
-from groq import AsyncGroq, RateLimitError
+from groq import AsyncGroq, BadRequestError, RateLimitError
 
 from mcp_client import mcp_session, tool_result_to_text, tool_to_groq_schema
 
@@ -23,8 +26,48 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Llama on Groq occasionally emits a tool call as a literal
+# `<function=name>{...}</function>` tag inside the plain-text content
+# instead of a structured tool_calls entry. Sometimes Groq itself rejects
+# this as a `tool_use_failed` 400 (handled in _complete_with_retry below),
+# but other times it comes back as an ordinary 200 with empty tool_calls —
+# which, left alone, makes the loop treat the raw tag text as the final
+# answer and leak it straight to the user.
+_PSEUDO_FUNCTION_CALL_RE = re.compile(
+    r"<function=(?P<name>[^>]+)>(?P<args>\{.*?\})</function>", re.DOTALL
+)
+
+
+def _extract_pseudo_tool_calls(content: str | None) -> list[dict[str, Any]] | None:
+    """Recovers tool calls Llama emitted as literal text so they can be
+    executed like normal tool calls, instead of showing the raw tag to the
+    user as if it were the assistant's answer.
+    """
+    if not content:
+        return None
+    matches = list(_PSEUDO_FUNCTION_CALL_RE.finditer(content))
+    if not matches:
+        return None
+    return [
+        {
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": m.group("name").strip(),
+                "arguments": m.group("args").strip(),
+            },
+        }
+        for m in matches
+    ]
+
+# llama-3.1-8b-instant instead of the 70b model: same tool-calling loop needs
+# several completions per turn (see MAX_TOOL_ROUNDS below), and the 8b model
+# gets a much higher free-tier RPM/TPM allowance on Groq, so it clears the
+# rate limit far less often for this workload.
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 MAX_TOOL_ROUNDS = 6
+RATE_LIMIT_MAX_RETRIES = 2
+RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5.0
 
 groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 
@@ -94,6 +137,99 @@ def _assistant_message_to_dict(msg: Any) -> dict[str, Any]:
     return d
 
 
+async def _complete_with_retry(messages: list[dict[str, Any]], llm_tools: list[dict[str, Any]]) -> Any:
+    """Calls the Groq completion endpoint, retrying once on `tool_use_failed`.
+
+    Llama on Groq occasionally emits a malformed tool-call tag as plain text
+    instead of a structured tool call, which Groq rejects with a 400
+    `tool_use_failed` error. This is sampling noise, not a real request
+    problem, so one immediate retry clears it in the common case instead of
+    failing the whole turn.
+    """
+    try:
+        return await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            tools=llm_tools,
+            tool_choice="auto",
+        )
+    except BadRequestError as exc:
+        body = exc.body if isinstance(exc.body, dict) else {}
+        code = body.get("error", {}).get("code")
+        if code != "tool_use_failed":
+            raise
+        logger.warning("Groq tool_use_failed, retrying once")
+        return await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            tools=llm_tools,
+            tool_choice="auto",
+        )
+
+
+def _retry_after_seconds(exc: RateLimitError) -> float:
+    """Reads Groq's `retry-after` response header so we wait exactly as long
+    as the provider says is needed, instead of guessing or giving up
+    immediately. Falls back to a short fixed wait if the header is missing
+    or unparseable.
+    """
+    header = exc.response.headers.get("retry-after") if exc.response is not None else None
+    if not header:
+        return RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    try:
+        return max(float(header), 0.0)
+    except ValueError:
+        return RATE_LIMIT_DEFAULT_WAIT_SECONDS
+
+
+async def _get_completion(messages: list[dict[str, Any]], llm_tools: list[dict[str, Any]]) -> Any | None:
+    """Runs one completion call for the loop below, retrying on 429s using
+    Groq's own retry-after guidance rather than failing on the first hit.
+
+    Returns the completion response, or None if the call ultimately failed
+    (a user-facing message has already been appended to `messages` in that
+    case, so the caller just needs to stop the loop).
+    """
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return await _complete_with_retry(messages, llm_tools)
+        except RateLimitError as exc:
+            if attempt == RATE_LIMIT_MAX_RETRIES:
+                logger.exception("Groq completion request rate-limited after retries")
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "The assistant is temporarily rate-limited by the LLM "
+                            "provider — please try again in a few minutes."
+                        ),
+                    }
+                )
+                return None
+            wait_s = _retry_after_seconds(exc)
+            logger.warning(
+                "Groq rate-limited (attempt %d/%d), waiting %.1fs before retry",
+                attempt + 1,
+                RATE_LIMIT_MAX_RETRIES,
+                wait_s,
+            )
+            await asyncio.sleep(wait_s)
+        except Exception:
+            # A malformed tool call, provider outage, etc. must not crash
+            # the whole request (and, worse, the shared MCP session's
+            # connection) — surface a normal assistant reply instead so the
+            # frontend gets a clean response to show the user.
+            logger.exception("Groq completion request failed")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Sorry, I ran into a problem processing that — could you try rephrasing?",
+                }
+            )
+            return None
+    return None
+
+
 async def run_agent_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Runs the tool-calling loop for one user turn and returns updated messages.
 
@@ -107,58 +243,39 @@ async def run_agent_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
 
         rounds = 0
         while True:
-            try:
-                response = await groq_client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=messages,
-                    tools=llm_tools,
-                    tool_choice="auto",
-                )
-            except RateLimitError:
-                # The daily/per-minute token quota on the Groq account is
-                # exhausted — no rephrasing will fix this, so say so instead
-                # of the generic fallback below.
-                logger.exception("Groq completion request rate-limited")
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "The assistant is temporarily rate-limited by the LLM "
-                            "provider — please try again in a few minutes."
-                        ),
-                    }
-                )
-                break
-            except Exception:
-                # A malformed tool call, provider outage, etc. must not
-                # crash the whole request (and, worse, the shared MCP
-                # session's connection) — surface a normal assistant reply
-                # instead so the frontend gets a clean response to show
-                # the user.
-                logger.exception("Groq completion request failed")
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "Sorry, I ran into a problem processing that — could you try rephrasing?",
-                    }
-                )
+            response = await _get_completion(messages, llm_tools)
+            if response is None:
                 break
 
             msg = response.choices[0].message
-            messages.append(_assistant_message_to_dict(msg))
+            assistant_dict = _assistant_message_to_dict(msg)
 
-            if not msg.tool_calls:
+            tool_calls = assistant_dict.get("tool_calls")
+            if not tool_calls:
+                pseudo_calls = _extract_pseudo_tool_calls(assistant_dict.get("content"))
+                if pseudo_calls:
+                    logger.warning(
+                        "Recovered pseudo tool call(s) emitted as plain text: %s",
+                        [c["function"]["name"] for c in pseudo_calls],
+                    )
+                    assistant_dict["tool_calls"] = pseudo_calls
+                    assistant_dict["content"] = None
+                    tool_calls = pseudo_calls
+
+            messages.append(assistant_dict)
+
+            if not tool_calls:
                 break
 
-            for call in msg.tool_calls:
-                tool_name = call.function.name
+            for call in tool_calls:
+                tool_name = call["function"]["name"]
                 try:
-                    args = json.loads(call.function.arguments or "{}")
+                    args = json.loads(call["function"]["arguments"] or "{}")
                 except json.JSONDecodeError as exc:
                     messages.append(
                         {
                             "role": "tool",
-                            "tool_call_id": call.id,
+                            "tool_call_id": call["id"],
                             "content": f"ERROR: could not parse arguments as JSON: {exc}",
                         }
                     )
@@ -177,7 +294,7 @@ async def run_agent_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": call.id,
+                        "tool_call_id": call["id"],
                         "content": content,
                     }
                 )

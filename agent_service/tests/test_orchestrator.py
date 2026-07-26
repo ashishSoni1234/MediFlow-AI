@@ -254,6 +254,60 @@ def test_run_agent_turn_stops_after_max_tool_rounds(monkeypatch):
     assert "haven't reached a final answer" in result[-1]["content"]
 
 
+def test_run_agent_turn_recovers_pseudo_tool_call_leaked_as_text(monkeypatch):
+    """Reproduces a real failure: llama-3.1-8b-instant on Groq sometimes
+    emits a tool call as a literal `<function=name>{...}</function>` tag in
+    plain-text content instead of a structured tool_calls entry, and Groq
+    returns this as an ordinary 200 (not the tool_use_failed 400 that
+    _complete_with_retry already handles). Without recovery, the raw tag
+    text leaks straight to the user as if it were the final answer.
+    """
+    session = FakeSession(
+        tools=[FakeTool("get_appointment_stats")],
+        result_text='{"total": 2, "appointments": []}',
+    )
+    patch_mcp_session(monkeypatch, session)
+    patch_groq_responses(
+        monkeypatch,
+        [
+            FakeResponse(
+                FakeMessage(
+                    content=(
+                        "Let me check that.\n"
+                        '<function=get_appointment_stats>{"date_range": '
+                        '"2026-07-26:2026-07-27", "doctor_name": "Dr. Ahuja", '
+                        '"filter_reason": "fever"}</function>'
+                    ),
+                    tool_calls=[],
+                )
+            ),
+            FakeResponse(FakeMessage(content="2 patients came in with fever.")),
+        ],
+    )
+
+    messages = [
+        orch.build_system_message("doctor"),
+        {"role": "user", "content": "how many patients came in with fever?"},
+    ]
+    result = run(orch.run_agent_turn(messages))
+
+    assert session.calls == [
+        (
+            "get_appointment_stats",
+            {
+                "date_range": "2026-07-26:2026-07-27",
+                "doctor_name": "Dr. Ahuja",
+                "filter_reason": "fever",
+            },
+        )
+    ]
+    # the raw <function=...> tag must never reach the user
+    for m in result:
+        if m["content"]:
+            assert "<function=" not in m["content"]
+    assert result[-1]["content"] == "2 patients came in with fever."
+
+
 def test_run_agent_turn_surfaces_rate_limit_error_without_crashing(monkeypatch):
     session = FakeSession(tools=[FakeTool("check_doctor_availability")])
     patch_mcp_session(monkeypatch, session)
