@@ -38,7 +38,7 @@ mcp_server/       FastMCP app — tools, resources, prompts (the MCP "server")
   server.py         tool/resource/prompt registrations
   db.py             Postgres access layer
   google_calendar.py  Google Calendar event creation (OAuth refresh-token flow)
-  email_service.py    SMTP confirmation emails
+  email_service.py    Brevo API confirmation emails
 agent_service/    FastAPI app — the MCP "client" + Groq orchestration
   main.py            HTTP API for the frontend
   mcp_client.py       wraps ClientSession / tool discovery / result formatting
@@ -89,7 +89,7 @@ cp .env.example .env
 ```
 
 Fill in at minimum `GROQ_API_KEY` (free tier at console.groq.com/keys). Google Calendar
-and SMTP are optional — `book_appointment` and
+and Brevo (email) are optional — `book_appointment` and
 `send_appointment_confirmation_email` degrade gracefully (booking still succeeds in
 Postgres; the tool just reports that the calendar/email step was skipped) when those
 env vars are blank, so you can demo the whole flow without setting them up.

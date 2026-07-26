@@ -151,12 +151,21 @@ async def check_doctor_availability(doctor_name: str, date: str, time_window: st
             return True
         free_slots = [s for s in free_slots if in_window(s)]
 
-    return {
+    result = {
         "doctor_name": doctor["name"],
         "date": target_day.isoformat(),
         "working_hours": f"{doctor['working_hours_start']}-{doctor['working_hours_end']}",
         "free_slots": free_slots,
     }
+    if time_window and not free_slots:
+        result["message"] = (
+            f"No free slots in the '{time_window}' window on {target_day.isoformat()}. "
+            f"{doctor['name']}'s working hours that day are "
+            f"{doctor['working_hours_start']}-{doctor['working_hours_end']}, so this window may fall "
+            "outside them or be fully booked. Do not substitute slots from a different window "
+            "without telling the patient you're doing so."
+        )
+    return result
 
 
 @mcp.tool()
@@ -385,10 +394,11 @@ async def send_appointment_confirmation_email(appointment_id: int) -> dict:
         email_service.send_email, appt["patient_email"], subject, text_body, html_body
     )
     if not sent:
-        return {
-            "sent": False,
-            "message": "Email not sent: SMTP is not configured on the server (SMTP_USER/SMTP_APP_PASSWORD missing).",
-        }
+        if not email_service.is_configured():
+            message = "Email not sent: email service is not configured on the server (BREVO_API_KEY/BREVO_SENDER_EMAIL missing)."
+        else:
+            message = "Email not sent: the email provider rejected or failed the send. Check server logs for details."
+        return {"sent": False, "message": message}
     return {"sent": True, "message": f"Confirmation email sent to {appt['patient_email']}."}
 
 

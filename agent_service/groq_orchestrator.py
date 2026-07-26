@@ -113,8 +113,10 @@ def build_system_message(role: str) -> dict[str, str]:
             "what's still needed and do not retry the booking until they've "
             "provided it. If book_appointment fails because the slot is already "
             "taken, call suggest_reschedule with the same doctor and originally "
-            "requested time, and offer the patient the 2-3 nearest alternative "
-            "slots instead of just reporting the failure."
+            "requested time, and offer the patient only the exact slots "
+            "suggest_reschedule returned in 'suggested_slots' — never the slot "
+            "that was just rejected as taken, even if it happens to still "
+            "appear in a stale list you saw earlier in the conversation."
         )
     return {
         "role": "system",
@@ -138,6 +140,13 @@ def build_system_message(role: str) -> dict[str, str]:
             "tool with the same arguments more than once in a turn. When a tool "
             "result includes a 'total' or count field, quote that number exactly "
             "in your answer rather than recounting or adding results yourself. "
+            "When presenting 'free_slots' from check_doctor_availability, list "
+            "only the exact times present in that field, verbatim — never invent "
+            "extra times, never invent your own numbering scheme (e.g. 'enter a "
+            "number from 10 to 16') for the patient to pick from; just show the "
+            "times themselves and ask the patient to name one. If 'free_slots' is "
+            "empty, or the result includes a 'message' field, relay that message "
+            "plainly instead of substituting slots from a different time window. "
             "If a tool result includes 'confirmation_email_sent' or 'sent' as "
             "false for an email, tell the user plainly that the email could not "
             "be sent (e.g. suggest checking spam, or that they can ask again "

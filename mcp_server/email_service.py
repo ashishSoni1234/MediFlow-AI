@@ -1,105 +1,96 @@
-"""Email sending via SMTP (Gmail App Password), per Section 1's "simpler fallback".
+"""Email sending via Brevo's transactional email HTTP API.
 
-If SMTP credentials aren't configured, send_email returns False rather than
-raising, so the send_appointment_confirmation_email tool can report the
-outcome to the LLM without crashing the request.
+Render blocks outbound SMTP connections (port 587/465) from its web
+services — a direct smtplib connection to smtp.gmail.com fails there with
+"OSError: [Errno 101] Network is unreachable" no matter how correct the
+credentials are, even though the exact same code works from a local
+machine. Sending over HTTPS to Brevo's API sidesteps that block entirely,
+since outbound HTTPS is how this service already talks to Groq/Supabase/etc.
 
-Gmail's SMTP relay occasionally defers a send with a transient error (e.g.
-connection drop, or a temporary 4xx like "421 Try again later" under its
-anti-abuse rate limiting) even when credentials and network are fine. A single
-attempt treats that the same as a permanent failure, so send_email retries a
-bounded number of times with backoff before giving up.
+If Brevo isn't configured, send_email returns False rather than raising, so
+the send_appointment_confirmation_email tool can report the outcome to the
+LLM without crashing the request.
 """
 from __future__ import annotations
 
 import logging
 import os
-import smtplib
 import time
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD")
-SMTP_TIMEOUT_SECONDS = 15
-SMTP_MAX_ATTEMPTS = 3
-SMTP_RETRY_BACKOFF_SECONDS = 2
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
+BREVO_SENDER_EMAIL = os.environ.get("BREVO_SENDER_EMAIL")
+BREVO_SENDER_NAME = os.environ.get("BREVO_SENDER_NAME", "MediFlow AI")
+REQUEST_TIMEOUT_SECONDS = 15
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 2
 
-# Errors worth retrying: connection-level hiccups and SMTP 4xx (temporary,
-# server-requested retry) replies. SMTPAuthenticationError and other 5xx
-# (permanent) failures are not retried — retrying won't fix a bad password.
-_TRANSIENT_SMTP_ERRORS = (
-    smtplib.SMTPServerDisconnected,
-    smtplib.SMTPConnectError,
-    smtplib.SMTPHeloError,
-    smtplib.SMTPResponseException,
-    TimeoutError,
-    OSError,
-)
+# Errors worth retrying: connection-level hiccups and 5xx (server-side,
+# possibly transient) responses. 4xx responses (bad API key, unverified
+# sender, malformed request) won't succeed on retry.
+_TRANSIENT_ERRORS = (httpx.TransportError, httpx.TimeoutException)
 
 
 def is_configured() -> bool:
-    return bool(SMTP_USER and SMTP_APP_PASSWORD)
-
-
-def _is_permanent_smtp_error(exc: Exception) -> bool:
-    """5xx SMTP replies (bad address, auth rejected, etc.) won't succeed on retry."""
-    code = getattr(exc, "smtp_code", None)
-    return isinstance(exc, smtplib.SMTPResponseException) and code is not None and 500 <= code < 600
+    return bool(BREVO_API_KEY and BREVO_SENDER_EMAIL)
 
 
 def send_email(to_email: str, subject: str, body: str, html_body: str | None = None) -> bool:
-    """Sends a plain-text email, or a multipart text+HTML email if html_body is given.
+    """Sends a transactional email via Brevo; html_body is used if given, else body.
 
-    Mail clients that render HTML will show html_body; everything else falls
-    back to the plain-text body (MIME requires the plain-text alternative to
-    be attached first).
-
-    Transient SMTP errors are retried up to SMTP_MAX_ATTEMPTS times with
-    backoff; on final failure this logs the real exception and returns False
-    rather than raising, so a flaky send never breaks the booking it's for.
+    Transient errors (connection issues, 5xx) are retried up to MAX_ATTEMPTS
+    times with backoff; on final failure this logs the real error and
+    returns False rather than raising, so a flaky send never breaks the
+    booking it's for.
     """
     if not is_configured():
+        logger.warning("send_email to %s skipped: BREVO_API_KEY/BREVO_SENDER_EMAIL not configured", to_email)
         return False
 
-    if html_body:
-        msg: MIMEMultipart | MIMEText = MIMEMultipart("alternative")
-        msg.attach(MIMEText(body, "plain"))
-        msg.attach(MIMEText(html_body, "html"))
-    else:
-        msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = to_email
+    payload = {
+        "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_body or f"<pre>{body}</pre>",
+        "textContent": body,
+    }
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+    }
 
-    for attempt in range(1, SMTP_MAX_ATTEMPTS + 1):
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
-                server.starttls()
-                server.login(SMTP_USER, SMTP_APP_PASSWORD)
-                server.sendmail(SMTP_USER, [to_email], msg.as_string())
+            response = httpx.post(
+                BREVO_API_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS
+            )
+            if response.status_code >= 500:
+                response.raise_for_status()
+            if response.status_code >= 400:
+                logger.error(
+                    "send_email to %s failed: Brevo returned %d: %s",
+                    to_email, response.status_code, response.text,
+                )
+                return False
             return True
-        except _TRANSIENT_SMTP_ERRORS as exc:
-            if _is_permanent_smtp_error(exc) or attempt == SMTP_MAX_ATTEMPTS:
+        except (_TRANSIENT_ERRORS, httpx.HTTPStatusError) as exc:
+            if attempt == MAX_ATTEMPTS:
                 logger.exception(
                     "send_email to %s failed permanently after %d attempt(s)", to_email, attempt
                 )
                 return False
             logger.warning(
                 "send_email to %s failed on attempt %d/%d (%s: %s) — retrying in %ds",
-                to_email, attempt, SMTP_MAX_ATTEMPTS, type(exc).__name__, exc,
-                SMTP_RETRY_BACKOFF_SECONDS * attempt,
+                to_email, attempt, MAX_ATTEMPTS, type(exc).__name__, exc,
+                RETRY_BACKOFF_SECONDS * attempt,
             )
-            time.sleep(SMTP_RETRY_BACKOFF_SECONDS * attempt)
-        except Exception:
-            logger.exception("send_email to %s failed with a non-retryable error", to_email)
-            return False
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
     return False
