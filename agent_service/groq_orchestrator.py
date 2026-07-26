@@ -26,39 +26,53 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Llama on Groq occasionally emits a tool call as a literal
-# `<function=name>{...}</function>` tag inside the plain-text content
-# instead of a structured tool_calls entry. Sometimes Groq itself rejects
-# this as a `tool_use_failed` 400 (handled in _complete_with_retry below),
-# but other times it comes back as an ordinary 200 with empty tool_calls —
-# which, left alone, makes the loop treat the raw tag text as the final
-# answer and leak it straight to the user.
-_PSEUDO_FUNCTION_CALL_RE = re.compile(
-    r"<function=(?P<name>[^>]+)>(?P<args>\{.*?\})</function>", re.DOTALL
-)
+# Llama on Groq occasionally emits a tool call as literal text inside the
+# plain-text content instead of a structured tool_calls entry. The tag is
+# supposed to look like `<function=name>{...}</function>`, but in practice
+# the leading punctuation varies (`<function=`, `=function=`, `(function=`,
+# or nothing at all) and the closing `</function>` tag is frequently missing
+# entirely. Sometimes Groq itself rejects the well-formed case as a
+# `tool_use_failed` 400 (handled in _complete_with_retry below), but other
+# times it comes back as an ordinary 200 with empty tool_calls — which, left
+# alone, makes the loop treat the raw tag text (and any reasoning narrated
+# around it) as the final answer and leak it straight to the user.
+_PSEUDO_FUNCTION_CALL_HEADER_RE = re.compile(r"[<(=]?function=(?P<name>[a-zA-Z0-9_]+)>")
 
 
 def _extract_pseudo_tool_calls(content: str | None) -> list[dict[str, Any]] | None:
     """Recovers tool calls Llama emitted as literal text so they can be
-    executed like normal tool calls, instead of showing the raw tag to the
-    user as if it were the assistant's answer.
+    executed like normal tool calls, instead of showing the raw tag (and any
+    surrounding reasoning text) to the user as if it were the assistant's
+    answer.
+
+    Only the opening `name>` header is matched strictly; the JSON argument
+    object that follows is parsed with a real JSON decoder (scanning for the
+    matching closing brace) rather than a `{.*?}` regex, since that assumed
+    a closing `</function>` tag terminates it — which real leaks often omit.
     """
     if not content:
         return None
-    matches = list(_PSEUDO_FUNCTION_CALL_RE.finditer(content))
-    if not matches:
-        return None
-    return [
-        {
-            "id": f"call_{uuid.uuid4().hex[:24]}",
-            "type": "function",
-            "function": {
-                "name": m.group("name").strip(),
-                "arguments": m.group("args").strip(),
-            },
-        }
-        for m in matches
-    ]
+    decoder = json.JSONDecoder()
+    calls: list[dict[str, Any]] = []
+    for m in _PSEUDO_FUNCTION_CALL_HEADER_RE.finditer(content):
+        tail = content[m.end():]
+        if not tail.startswith("{"):
+            continue  # header must be immediately followed by the JSON object
+        try:
+            args_obj, _end = decoder.raw_decode(tail)
+        except json.JSONDecodeError:
+            continue
+        calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": m.group("name").strip(),
+                    "arguments": json.dumps(args_obj),
+                },
+            }
+        )
+    return calls or None
 
 # llama-3.1-8b-instant instead of the 70b model: same tool-calling loop needs
 # several completions per turn (see MAX_TOOL_ROUNDS below), and the 8b model
@@ -73,7 +87,8 @@ groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
 def build_system_message(role: str) -> dict[str, str]:
-    today = dt.date.today().isoformat()
+    today_date = dt.date.today()
+    today = f"{today_date.isoformat()} ({today_date.strftime('%A')})"
     if role == "doctor":
         audience = (
             "You are speaking with a doctor using their dashboard. They may ask "
@@ -106,6 +121,15 @@ def build_system_message(role: str) -> dict[str, str]:
         "content": (
             "You are the MediFlow-AI clinic assistant. "
             f"Today's date is {today}. "
+            "When the user refers to a relative day ('tomorrow', 'next Wednesday', "
+            "'this Friday', etc.), work out the exact ISO date yourself from "
+            "today's date above and pass that resolved date to tools. Do this "
+            "silently — never show this calculation, or any other internal "
+            "reasoning about what to do next, in your reply. Every reply must be "
+            "either a tool call or a direct message to the user (a question, a "
+            "tool result explained in plain language, or a final answer) — "
+            "never both narration and a tool call in the same reply, and never "
+            "raw text like 'function=...' or a tool name in your reply. "
             f"{audience} "
             "Use the available tools to look up real data and take real actions — "
             "never guess availability, stats, or booking outcomes. If a tool call "

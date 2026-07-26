@@ -210,6 +210,11 @@ async def agent_message(
     history = await session_store.load_history(req.session_id)
     if not history:
         history = [build_system_message(role)]
+    else:
+        # Refresh rather than reuse the stored system message: it embeds
+        # today's date, and a session that lives past midnight would
+        # otherwise keep telling the model yesterday's date forever.
+        history[0] = build_system_message(role)
 
     history.append({"role": "user", "content": req.text})
 

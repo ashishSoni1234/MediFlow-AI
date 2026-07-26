@@ -308,6 +308,77 @@ def test_run_agent_turn_recovers_pseudo_tool_call_leaked_as_text(monkeypatch):
     assert result[-1]["content"] == "2 patients came in with fever."
 
 
+def test_run_agent_turn_recovers_malformed_pseudo_tool_call_variants(monkeypatch):
+    """Reproduces a real production leak: llama-3.1-8b-instant emitted
+    `=function=name>{...}` (no leading `<`, no closing `</function>` tag) and
+    `(function=name>{...}` in the same reply, interleaved with narrated
+    reasoning ("I need to get today's date..."). The original recovery regex
+    only matched the well-formed `<function=name>{...}</function>` tag, so
+    none of this was recognized as a tool call and the whole thing —
+    reasoning text included — leaked to the user verbatim.
+    """
+    session = FakeSession(
+        tools=[FakeTool("check_doctor_availability"), FakeTool("book_appointment")],
+        result_text='{"slots": ["2026-07-27T10:00:00"]}',
+    )
+    patch_mcp_session(monkeypatch, session)
+    patch_groq_responses(
+        monkeypatch,
+        [
+            FakeResponse(
+                FakeMessage(
+                    content=(
+                        "I need to get today's date to check the correct "
+                        "availability on Wednesday.\n\n"
+                        "Today's date is July 26, which means Wednesday's "
+                        "date would be July 27.\n\n"
+                        '=function=check_doctor_availability>{"date": '
+                        '"2026-07-27", "doctor_name": "Dr. Ahuja", '
+                        '"time_window": null}\n\n'
+                        "Please wait for the result.\n\n"
+                        '(function=book_appointment>{"doctor_name": "Dr. Ahuja", '
+                        '"patient_name": "Pankaj", "patient_email": '
+                        '"soniashish37066@gmail.com", "datetime_iso": "", '
+                        '"reason": "fever and cold", "duration_minutes": 30}'
+                    ),
+                    tool_calls=[],
+                )
+            ),
+            FakeResponse(FakeMessage(content="Dr. Ahuja is free at 10:00 AM on Wednesday.")),
+        ],
+    )
+
+    messages = [
+        orch.build_system_message("patient"),
+        {"role": "user", "content": "check wednesday availability and book it"},
+    ]
+    result = run(orch.run_agent_turn(messages))
+
+    assert session.calls == [
+        (
+            "check_doctor_availability",
+            {"date": "2026-07-27", "doctor_name": "Dr. Ahuja", "time_window": None},
+        ),
+        (
+            "book_appointment",
+            {
+                "doctor_name": "Dr. Ahuja",
+                "patient_name": "Pankaj",
+                "patient_email": "soniashish37066@gmail.com",
+                "datetime_iso": "",
+                "reason": "fever and cold",
+                "duration_minutes": 30,
+            },
+        ),
+    ]
+    # neither the raw tag syntax nor the narrated reasoning may reach the user
+    for m in result:
+        if m["role"] == "assistant" and m["content"]:
+            assert "function=" not in m["content"]
+            assert "I need to get today's date" not in m["content"]
+    assert result[-1]["content"] == "Dr. Ahuja is free at 10:00 AM on Wednesday."
+
+
 def test_run_agent_turn_surfaces_rate_limit_error_without_crashing(monkeypatch):
     session = FakeSession(tools=[FakeTool("check_doctor_availability")])
     patch_mcp_session(monkeypatch, session)
