@@ -99,8 +99,27 @@ async def _resolve_doctor(doctor_name: str) -> tuple[dict | None, dict | None]:
     return matches[0], None
 
 
+_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
 def _parse_date(value: str) -> dt.date:
-    """Accepts 'today', 'tomorrow', 'yesterday', or an ISO date string."""
+    """Accepts 'today', 'tomorrow', 'yesterday', a weekday name (optionally
+    prefixed with 'this ' or 'next '), or an ISO date string.
+
+    Weekday names are resolved here, deterministically, rather than asking
+    the LLM to work out the ISO date itself — an 8b model doing that mental
+    arithmetic silently is exactly what previously caused it to book a
+    patient's requested "Wednesday" appointment on the current day (a
+    Monday) instead.
+    """
     value = value.strip().lower()
     today = dt.date.today()
     if value == "today":
@@ -109,6 +128,21 @@ def _parse_date(value: str) -> dt.date:
         return today + dt.timedelta(days=1)
     if value == "yesterday":
         return today - dt.timedelta(days=1)
+
+    day_token = value
+    is_explicit_next = False
+    for prefix in ("next ", "this coming ", "this "):
+        if value.startswith(prefix):
+            day_token = value[len(prefix):]
+            is_explicit_next = prefix == "next "
+            break
+
+    if day_token in _WEEKDAYS:
+        days_ahead = (_WEEKDAYS[day_token] - today.weekday()) % 7
+        if days_ahead == 0 and is_explicit_next:
+            days_ahead = 7
+        return today + dt.timedelta(days=days_ahead)
+
     return dt.date.fromisoformat(value)
 
 
@@ -118,8 +152,11 @@ async def check_doctor_availability(doctor_name: str, date: str, time_window: st
 
     Args:
         doctor_name: Doctor's name, e.g. "Dr. Ahuja" (partial match ok, e.g. "Ahuja").
-        date: The date to check. Accepts "today", "tomorrow", "yesterday", or an
-            ISO date string like "2026-07-26".
+        date: The date to check. Accepts "today", "tomorrow", "yesterday", a
+            weekday name like "wednesday" or "next wednesday" (resolved to the
+            nearest upcoming occurrence — pass the weekday name through as-is
+            rather than computing the date yourself), or an ISO date string
+            like "2026-07-26".
         time_window: Optional filter, one of "morning" (before 12:00),
             "afternoon" (12:00-17:00), or "evening" (after 17:00). Omit for the
             full day.

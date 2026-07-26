@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from db import _normalize_doctor_query, compute_free_slots, has_conflict  # noqa: E402
+from server import _parse_date  # noqa: E402
 
 
 def test_compute_free_slots_empty_day_covers_full_range():
@@ -77,3 +78,45 @@ def test_normalize_doctor_query_only_strips_leading_dr_title():
     # "dr" appearing mid-name (e.g. a doctor actually named "Dravid") must
     # not be stripped — only a leading "Dr"/"Dr." title token should be.
     assert _normalize_doctor_query("Dr. Dravid") == "dravid"
+
+
+class _FixedDate(dt.date):
+    """Lets us pin dt.date.today() inside server._parse_date for these tests."""
+
+    _fixed: dt.date
+
+    @classmethod
+    def today(cls):
+        return cls._fixed
+
+
+def _with_fixed_today(monkeypatch, fixed: dt.date):
+    _FixedDate._fixed = fixed
+    monkeypatch.setattr(dt, "date", _FixedDate)
+
+
+def test_parse_date_bare_weekday_name_resolves_to_nearest_upcoming_occurrence(monkeypatch):
+    # Regression test: a patient asking for "Wednesday" while today is Monday
+    # must resolve to the upcoming Wednesday, not silently fall back to today.
+    _with_fixed_today(monkeypatch, dt.date(2026, 7, 27))  # Monday
+    assert _parse_date("wednesday") == dt.date(2026, 7, 29)
+
+
+def test_parse_date_next_weekday_prefix_resolves_same_as_bare_name_mid_week(monkeypatch):
+    _with_fixed_today(monkeypatch, dt.date(2026, 7, 27))  # Monday
+    assert _parse_date("next wednesday") == dt.date(2026, 7, 29)
+
+
+def test_parse_date_bare_weekday_on_that_same_day_returns_today(monkeypatch):
+    _with_fixed_today(monkeypatch, dt.date(2026, 7, 29))  # Wednesday
+    assert _parse_date("wednesday") == dt.date(2026, 7, 29)
+
+
+def test_parse_date_next_weekday_on_that_same_day_skips_to_following_week(monkeypatch):
+    _with_fixed_today(monkeypatch, dt.date(2026, 7, 29))  # Wednesday
+    assert _parse_date("next wednesday") == dt.date(2026, 8, 5)
+
+
+def test_parse_date_this_weekday_prefix_behaves_like_bare_name(monkeypatch):
+    _with_fixed_today(monkeypatch, dt.date(2026, 7, 27))  # Monday
+    assert _parse_date("this friday") == dt.date(2026, 7, 31)
