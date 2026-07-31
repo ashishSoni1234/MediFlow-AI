@@ -1,6 +1,6 @@
 """Postgres access layer for the MCP server.
 
-Keeps all SQL in one place so the tool functions in server.py stay
+Keeps all SQL in one  so the tool functions in server.py stay
 focused on MCP concerns (schemas, descriptions) rather than queries.
 """
 from __future__ import annotations
