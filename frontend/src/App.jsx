@@ -22,7 +22,7 @@ export default function App() {
     setUser(null);
     setTab("main");
   }
-
+// this will return all  div 
   return (
     <div className={`app${!user ? " app--auth" : ""}`}>
       {user && (
