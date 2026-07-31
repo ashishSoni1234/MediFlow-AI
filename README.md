@@ -378,7 +378,7 @@ Dr. Ahuja's "Get Today's Summary" button runs the `summarize_doctor_day` MCP pro
 
 ![Doctor dashboard notifications panel](Images/Screenshot%202026-07-27%20025458.png)
 
-The generated summary is also pushed to the notification bell as an `IN_APP` entry, proving the report reaches the doctor through a delivery channel separate from the patient-side confirmation email.
+The generated summary is also pushed to the notification section  bell as an `IN_APP` entry, proving the report reaches the doctor through a delivery channel separate from the patient-side confirmation email.
 
 ---
 
