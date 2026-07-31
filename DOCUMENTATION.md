@@ -25,7 +25,7 @@
 
 ## 1. What MediFlow-AI Does
 
-MediFlow-AI is an AI clinic-assistant web app with two user roles:
+MediFlow-AI is an Ai clinic-assistant web app with two user roles:
 
 - **Patients** chat in plain English to check a doctor's availability and book an appointment — no forms, no dropdowns.
 - **Doctors** get a dashboard with a one-click "Get Today's Summary" button, an in-app notification feed, and their own natural-language chat box for questions like "how many patients came in with fever this week?"
