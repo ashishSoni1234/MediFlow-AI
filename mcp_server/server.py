@@ -1,6 +1,6 @@
 """MediFlow-AI MCP Server.
 
-This is the MCP "server" in the client/server split: it exposes tools,
+This is the MCP "server" in client/server split: it exposes tools,
 resources, and prompts over the Model Context Protocol. It knows nothing
 about the LLM or how tools get chosen — that's the agent (client) side.
 
